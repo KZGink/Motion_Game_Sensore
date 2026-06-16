@@ -1,0 +1,965 @@
+"""
+test1.py - MotionQuiz Game with Improved Shooting
+Features:
+- Fullscreen camera feed with game overlay
+- Falling ball
+- Player shoots using pistol gesture (index + middle fingers)
+- Both hands supported
+- Accurate bullet aiming (Index Tip → Knuckle)
+- Fast bullet travel (speed=4000 pixels/sec)
+- Slightly larger hitbox for easier hits
+- Questions appear on hit; answer by pointing left/right and shooting
+- Quit via clickable button or 'q'
+"""
+
+import cv2
+import mediapipe as mp
+import random
+import time
+from typing import Tuple, List
+import json
+
+# ---------------- Load Questions ----------------
+try:
+    with open("questions.json", "r") as f:
+        data = json.load(f)
+    # SAMPLE_QUESTIONS is defined here from the JSON file
+    SAMPLE_QUESTIONS: List[Tuple[str, str]] = [(q["question"], q["answer"]) for q in data["questions"]]
+except (FileNotFoundError, json.JSONDecodeError) as e:
+    print(f"Error loading questions.json: {e}. Using emergency fallback questions.")
+    # Fallback list for safety
+    SAMPLE_QUESTIONS: List[Tuple[str, str]] = [
+        ("Fallback Q: Is the JSON file working? (Left: Yes | Right: No)", "R"),
+        ("Fallback Q: Use JSON format: \"question\" and \"answer\"? (Left: No | Right: Yes)", "R"),
+    ]
+# ---------------- USER SETTINGS ----------------
+CAMERA_INDEX = 0
+WINDOW_NAME = "MotionQuiz - Hand Game (Fullscreen)"
+START_TIMER_SECONDS = 12 * 60
+BALL_RADIUS = 30
+BALL_COLOR = (50, 150, 255)
+BALL_FALL_SPEED = 6
+BULLET_SPEED = 4000.0 # very fast
+BULLET_THICKNESS = 4
+BULLET_COLOR = (0, 255, 255)
+BULLET_LIFETIME = 1.2
+MUZZLE_FLASH_DURATION = 0.12
+QUESTION_TIMEOUT = 15.0
+SHOOT_COOLDOWN = 0.5 # faster shooting
+HITBOX_RADIUS = 45 # slightly bigger for easier hits
+# ------------------------------------------------
+
+# MediaPipe setup
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+
+# Quit button (Initialized in main for dynamic sizing)
+QUIT_BUTTON = {"tl": (0, 0), "br": (0, 0)}
+mouse_click_pos = None
+
+def on_mouse(event, x, y, flags, param):
+    global mouse_click_pos
+    if event == cv2.EVENT_LBUTTONDOWN:
+        mouse_click_pos = (x, y)
+
+def format_time(seconds: int) -> str:
+    if seconds < 0:
+        seconds = 0
+    m = int(seconds) // 60
+    s = int(seconds) % 60
+    return f"{m:02d}:{s:02d}"
+
+def is_pistol_gesture(hand_landmarks) -> bool:
+    try:
+        lm = hand_landmarks.landmark
+        # Helper function: tip_y < pip_y means the finger is UP
+        def finger_up(tip, pip): return lm[tip].y < lm[pip].y
+        
+        # Index (8) and Middle (12) must be up
+        index_up = finger_up(8, 6)
+        middle_up = finger_up(12, 10)
+        
+        # Ring (16) and Pinky (20) must be down (tip_y > pip_y)
+        # Corrected logic: not finger_up(tip, pip) means finger is down
+        ring_down = not finger_up(16, 14) 
+        pinky_down = not finger_up(20, 18)
+        
+        return index_up and middle_up and ring_down and pinky_down
+    except Exception:
+        return False
+
+def landmark_to_pixel(landmark, frame_w: int, frame_h: int) -> Tuple[int, int]:
+    return int(landmark.x * frame_w), int(landmark.y * frame_h)
+
+class FallingBall:
+    def __init__(self, frame_w: int, frame_h: int):
+        self.frame_w = frame_w
+        self.frame_h = frame_h
+        self.reset()
+    def reset(self):
+        self.x = random.randint(BALL_RADIUS + 10, self.frame_w - BALL_RADIUS - 10)
+        self.y = -BALL_RADIUS
+        self.active = True
+    def update(self):
+        if self.active:
+            self.y += BALL_FALL_SPEED
+            if self.y - BALL_RADIUS > self.frame_h:
+                self.reset()
+    def draw(self, frame):
+        cv2.circle(frame, (int(self.x), int(self.y)), BALL_RADIUS, BALL_COLOR, -1)
+        cv2.circle(frame, (int(self.x - BALL_RADIUS // 3), int(self.y - BALL_RADIUS // 3)), BALL_RADIUS // 6, (255, 255, 255), -1)
+    def is_hit_by(self, px, py):
+        dx = px - self.x
+        dy = py - self.y
+        return (dx*dx + dy*dy) <= (HITBOX_RADIUS*HITBOX_RADIUS)
+
+class Bullet:
+    def __init__(self, x, y, dx, dy):
+        self.x = x
+        self.y = y
+        self.dx = dx
+        self.dy = dy
+        self.spawn_time = time.time()
+    def update(self, dt):
+        self.x += self.dx * dt
+        self.y += self.dy * dt
+    def draw(self, frame):
+        cv2.line(frame, (int(self.x), int(self.y)), (int(self.x - self.dx*0.02), int(self.y - self.dy*0.02)), BULLET_COLOR, BULLET_THICKNESS)
+    def expired(self):
+        return time.time() - self.spawn_time > BULLET_LIFETIME
+
+def draw_quit_button_and_timer(frame, timer_seconds):
+    h, w = frame.shape[:2]
+    btn_w, btn_h = 140, 40
+    spacing = 12
+    x2 = w - spacing
+    y1 = spacing
+    x1 = x2 - btn_w
+    y2 = y1 + btn_h
+    QUIT_BUTTON["tl"] = (x1, y1)
+    QUIT_BUTTON["br"] = (x2, y2)
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), (0,0,0), -1)
+    cv2.addWeighted(overlay,0.35,frame,0.65,0,frame)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (200,200,200), 1)
+    # RESTORED MISSING LINES:
+    cv2.putText(frame, "Quit (click)", (x1+10, y1+26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (220,220,220), 2, cv2.LINE_AA)
+    timer_text = format_time(int(timer_seconds))
+    (tw, th), _ = cv2.getTextSize(timer_text, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
+    timer_x = x1 - spacing - tw
+    timer_y = y1 + 26
+    cv2.putText(frame, timer_text, (timer_x, timer_y), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255),2,cv2.LINE_AA)
+
+def show_question_overlay(frame, question_text: str):
+    h,w = frame.shape[:2]
+    overlay = frame.copy()
+    alpha=0.75
+    cv2.rectangle(overlay,(40,80),(w-40,200),(0,0,0),-1)
+    cv2.addWeighted(overlay,alpha,frame,1-alpha,0,frame)
+    cv2.putText(frame, question_text,(60,130),cv2.FONT_HERSHEY_SIMPLEX,0.8,(230,230,230),2,cv2.LINE_AA)
+    left_zone = (60,220,w//2-40,h-100)
+    right_zone = (w//2+20,220,w-60,h-100)
+    cv2.rectangle(frame,(left_zone[0],left_zone[1]),(left_zone[2],left_zone[3]),(70,70,70),2)
+    cv2.putText(frame,"Left Answer Area (A)",(left_zone[0]+20,left_zone[1]+30),cv2.FONT_HERSHEY_SIMPLEX,0.7,(200,200,200),2,cv2.LINE_AA)
+    cv2.rectangle(frame,(right_zone[0],right_zone[1]),(right_zone[2],right_zone[3]),(70,70,70),2)
+    cv2.putText(frame,"Right Answer Area (B)",(right_zone[0]+20,right_zone[1]+30),cv2.FONT_HERSHEY_SIMPLEX,0.7,(200,200,200),2,cv2.LINE_AA)
+    return left_zone,right_zone
+
+def main():
+    global mouse_click_pos
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    if not cap.isOpened():
+        raise RuntimeError("Could not open camera.")
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(WINDOW_NAME, on_mouse)
+    try:
+        cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    except:
+        pass
+    ok, frame = cap.read()
+    if not ok: cap.release(); raise RuntimeError("Failed to read from camera.")
+    h, w = frame.shape[:2]
+    ball = FallingBall(w,h)
+    bullets: List[Bullet] = []
+    timer_seconds = START_TIMER_SECONDS
+    last_time = time.time()
+    in_question = False
+    current_question = None
+    question_start_time = 0.0
+    left_zone = right_zone = None
+    last_shoot_time = 0.0
+    hands = mp_hands.Hands(model_complexity=0,max_num_hands=2,min_detection_confidence=0.6,min_tracking_confidence=0.6)
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok: break
+            frame = cv2.flip(frame,1)
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = hands.process(frame_rgb)
+            now = time.time()
+            dt = now - last_time
+            last_time = now
+            if not in_question:
+                timer_seconds -= dt
+            if timer_seconds<0: timer_seconds=0
+            if not in_question: ball.update()
+            ball.draw(frame)
+            # Draw bullets
+            for b in bullets[:]:
+                b.update(dt)
+                b.draw(frame)
+                if b.expired():
+                    bullets.remove(b)
+                elif not in_question and ball.is_hit_by(b.x,b.y):
+                    timer_seconds += 60
+                    in_question = True
+                    # Safety check to ensure questions exist
+                    if SAMPLE_QUESTIONS:
+                        current_question = random.choice(SAMPLE_QUESTIONS)
+                    else:
+                        current_question = ("No questions loaded! Check questions.json.", "L")
+                    
+                    question_start_time = time.time()
+                    ball.active = False
+                    left_zone,right_zone = show_question_overlay(frame,current_question[0])
+                    bullets.remove(b)
+                    cv2.putText(frame,"Hit! Answer the question by pointing & shooting",(60,260),cv2.FONT_HERSHEY_SIMPLEX,0.6,(200,200,200),2,cv2.LINE_AA)
+            if results.multi_hand_landmarks:
+                for hand_landmarks in results.multi_hand_landmarks:
+                    mp_drawing.draw_landmarks(frame,hand_landmarks,mp_hands.HAND_CONNECTIONS,
+                                             mp_drawing.DrawingSpec(color=(0,255,0),thickness=1,circle_radius=2),
+                                             mp_drawing.DrawingSpec(color=(0,200,200),thickness=1))
+            # Detect shooting (for target or answering)
+            if results.multi_hand_landmarks:
+                for hand_landmarks in results.multi_hand_landmarks:
+                    if is_pistol_gesture(hand_landmarks):
+                        if time.time() - last_shoot_time > SHOOT_COOLDOWN:
+                            # Calculate bullet trajectory
+                            tip_x,tip_y = landmark_to_pixel(hand_landmarks.landmark[8],w,h)
+                            knuckle_x,knuckle_y = landmark_to_pixel(hand_landmarks.landmark[5],w,h)
+                            dx = tip_x - knuckle_x
+                            dy = tip_y - knuckle_y
+                            length = (dx**2+dy**2)**0.5
+                            if length==0: length=1
+                            vx = BULLET_SPEED*dx/length
+                            vy = BULLET_SPEED*dy/length
+                            
+                            # If in question mode, check if the shot is an answer
+                            if in_question:
+                                answer_point = (tip_x,tip_y)
+                                side = None
+                                
+                                if left_zone and right_zone: # Check to make sure zones are initialized
+                                    if left_zone[0]<=answer_point[0]<=left_zone[2] and left_zone[1]<=answer_point[1]<=left_zone[3]:
+                                        side='L'
+                                    elif right_zone[0]<=answer_point[0]<=right_zone[2] and right_zone[1]<=answer_point[1]<=right_zone[3]:
+                                        side='R'
+                                
+                                if side:
+                                    last_shoot_time = time.time() # Only update shoot time on a successful answer attempt
+                                    if side==current_question[1]:
+                                        timer_seconds += 3*60
+                                        cv2.putText(frame,"Correct! +3:00",(60,340),cv2.FONT_HERSHEY_SIMPLEX,0.9,(50,220,50),3,cv2.LINE_AA)
+                                    else:
+                                        timer_seconds -= 4*60
+                                        if timer_seconds<0: timer_seconds=0
+                                        cv2.putText(frame,"Wrong! -4:00",(60,340),cv2.FONT_HERSHEY_SIMPLEX,0.9,(20,20,200),3,cv2.LINE_AA)
+                                    in_question=False
+                                    current_question=None
+                                    ball.reset()
+                                    ball.active=True
+                            else:
+                                # If not answering a question, shoot a regular bullet
+                                bullets.append(Bullet(tip_x,tip_y,vx,vy))
+                                last_shoot_time = time.time()
+            
+            # Question logic (Timeout check)
+            if in_question:
+                # Ensure question overlay is drawn every frame while active
+                left_zone,right_zone = show_question_overlay(frame,current_question[0]) 
+                
+                if time.time()-question_start_time>QUESTION_TIMEOUT:
+                    timer_seconds -= 4*60
+                    if timer_seconds<0: timer_seconds=0
+                    cv2.putText(frame,"Time's up! -4:00",(60,340),cv2.FONT_HERSHEY_SIMPLEX,0.9,(20,20,200),3,cv2.LINE_AA)
+                    in_question=False
+                    current_question=None
+                    ball.reset()
+                    ball.active=True
+            
+            draw_quit_button_and_timer(frame,int(timer_seconds))
+            
+            if mouse_click_pos:
+                mx,my = mouse_click_pos
+                tl = QUIT_BUTTON["tl"]
+                br = QUIT_BUTTON["br"]
+                if tl[0]<=mx<=br[0] and tl[1]<=my<=br[1]:
+                    print("Quit button clicked -> exiting.")
+                    break
+                mouse_click_pos=None
+            
+            if timer_seconds<=0:
+                cv2.putText(frame,"Time's up! Game Over.",(w//2-220,h//2),cv2.FONT_HERSHEY_SIMPLEX,1.2,(0,0,255),4,cv2.LINE_AA)
+                cv2.imshow(WINDOW_NAME,frame)
+                cv2.waitKey(2000)
+                break
+            
+            cv2.imshow(WINDOW_NAME,frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key==ord('q'): break
+    finally:
+        try: hands.close()
+        except: pass
+        cap.release()
+        cv2.destroyAllWindows()
+
+if __name__=="__main__":
+    main()
+
+
+Phase 2
+import cv2
+import mediapipe as mp
+import random
+import time
+import json
+import os
+from typing import Tuple, List
+
+# ---------------- USER SETTINGS ----------------
+CAMERA_INDEX = 0
+WINDOW_NAME = "MotionQuiz - Hand Game"
+START_TIMER_SECONDS = 10 * 60
+BALL_RADIUS = 30
+BALL_COLOR = (50, 150, 255)
+BALL_FALL_SPEED = 6
+BULLET_SPEED = 4000.0
+BULLET_THICKNESS = 4
+BULLET_COLOR = (0, 255, 255)
+BULLET_LIFETIME = 1.2
+QUESTION_TIMEOUT = 15.0
+SHOOT_COOLDOWN = 0.5
+HITBOX_RADIUS = 45
+
+# ---------------- Load Questions ----------------
+QUESTIONS_DATA = []
+try:
+    with open("questions.json", "r") as f:
+        data = json.load(f)
+        QUESTIONS_DATA = data["questions"]
+except Exception as e:
+    print(f"Error loading JSON: {e}")
+    # Minimal fallback if JSON fails
+    QUESTIONS_DATA = [{"question": "JSON Error! Quit?", "answer": "True", "type": "true_false"}]
+
+# ---------------- MediaPipe Setup ----------------
+# Use a more robust import for newer Python versions
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+
+QUIT_BUTTON = {"tl": (0, 0), "br": (0, 0)}
+mouse_click_pos = None
+
+def on_mouse(event, x, y, flags, param):
+    global mouse_click_pos
+    if event == cv2.EVENT_LBUTTONDOWN:
+        mouse_click_pos = (x, y)
+
+def is_pistol_gesture(hand_landmarks) -> bool:
+    try:
+        lm = hand_landmarks.landmark
+        def finger_up(tip, pip): return lm[tip].y < lm[pip].y
+        return finger_up(8, 6) and finger_up(12, 10) and not finger_up(16, 14) and not finger_up(20, 18)
+    except: return False
+
+def landmark_to_pixel(landmark, frame_w, frame_h):
+    return int(landmark.x * frame_w), int(landmark.y * frame_h)
+
+class FallingBall:
+    def __init__(self, w, h):
+        self.w, self.h = w, h
+        self.reset()
+    def reset(self):
+        self.x = random.randint(BALL_RADIUS + 10, self.w - BALL_RADIUS - 10)
+        self.y = -BALL_RADIUS
+        self.active = True
+    def update(self):
+        if self.active:
+            self.y += BALL_FALL_SPEED
+            if self.y > self.h: self.reset()
+    def draw(self, frame):
+        cv2.circle(frame, (int(self.x), int(self.y)), BALL_RADIUS, BALL_COLOR, -1)
+    def is_hit(self, px, py):
+        return ((px - self.x)**2 + (py - self.y)**2) <= (HITBOX_RADIUS**2)
+
+class Bullet:
+    def __init__(self, x, y, dx, dy):
+        self.x, self.y, self.dx, self.dy = x, y, dx, dy
+        self.spawn_time = time.time()
+    def update(self, dt):
+        self.x += self.dx * dt
+        self.y += self.dy * dt
+    def draw(self, frame):
+        cv2.line(frame, (int(self.x), int(self.y)), (int(self.x - self.dx*0.02), int(self.y - self.dy*0.02)), BULLET_COLOR, BULLET_THICKNESS)
+
+def draw_ui(frame, timer_seconds):
+    h, w = frame.shape[:2]
+    # Quit Button
+    x1, y1, x2, y2 = w-150, 10, w-10, 50
+    QUIT_BUTTON["tl"], QUIT_BUTTON["br"] = (x1, y1), (x2, y2)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 200), -1)
+    cv2.putText(frame, "QUIT", (x1+40, y1+30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    # Timer
+    m, s = divmod(int(timer_seconds), 60)
+    cv2.putText(frame, f"TIME: {m:02d}:{s:02d}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+def main():
+    global mouse_click_pos
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(WINDOW_NAME, on_mouse)
+    
+    ok, frame = cap.read()
+    h, w = frame.shape[:2]
+    ball = FallingBall(w, h)
+    bullets = []
+    hands = mp_hands.Hands(min_detection_confidence=0.7)
+    
+    timer_seconds = START_TIMER_SECONDS
+    last_time = time.time()
+    in_question = False
+    current_q = None
+    q_start_time = 0
+    last_shoot_time = 0
+
+    while cap.isOpened():
+        ok, frame = cap.read()
+        if not ok: break
+        frame = cv2.flip(frame, 1)
+        now = time.time()
+        dt = now - last_time
+        last_time = now
+
+        if not in_question:
+            timer_seconds -= dt
+            ball.update()
+        
+        # Process Hands
+        results = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        
+        # Bullets & Collision
+        for b in bullets[:]:
+            b.update(dt)
+            b.draw(frame)
+            if time.time() - b.spawn_time > BULLET_LIFETIME: bullets.remove(b)
+            elif not in_question and ball.is_hit(b.x, b.y):
+                in_question = True
+                current_q = random.choice(QUESTIONS_DATA)
+                q_start_time = time.time()
+                bullets.remove(b)
+
+        # Question Overlay Logic
+        if in_question:
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (50, 50), (w-50, h-50), (0, 0, 0), -1)
+            frame = cv2.addWeighted(overlay, 0.7, frame, 0.3, 0)
+            
+            # Draw Question Text
+            cv2.putText(frame, current_q["question"], (70, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            
+            # DRAW IMAGES (If image_choice)
+            if current_q.get("type") == "image_choice" and "images" in current_q:
+                for i, img_path in enumerate(current_q["images"][:2]): # Max 2 for L/R
+                    img = cv2.imread(img_path)
+                    if img is not None:
+                        img = cv2.resize(img, (200, 150))
+                        x_pos = 100 if i == 0 else w - 300
+                        frame[200:350, x_pos:x_pos+200] = img
+                        label = "LEFT" if i == 0 else "RIGHT"
+                        cv2.putText(frame, label, (x_pos, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            else:
+                # Text-based options
+                cv2.putText(frame, "Shoot LEFT or RIGHT to answer", (w//2-150, h-100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+
+            # Timeout check
+            if time.time() - q_start_time > QUESTION_TIMEOUT:
+                in_question = False
+                timer_seconds -= 60
+
+        # Shooting Logic
+        if results.multi_hand_landmarks:
+            for hl in results.multi_hand_landmarks:
+                mp_drawing.draw_landmarks(frame, hl, mp_hands.HAND_CONNECTIONS)
+                if is_pistol_gesture(hl) and (time.time() - last_shoot_time > SHOOT_COOLDOWN):
+                    tip = landmark_to_pixel(hl.landmark[8], w, h)
+                    knuckle = landmark_to_pixel(hl.landmark[5], w, h)
+                    dx, dy = tip[0] - knuckle[0], tip[1] - knuckle[1]
+                    dist = (dx**2 + dy**2)**0.5 or 1
+                    
+                    if in_question:
+                        # Answer Logic
+                        side = "L" if tip[0] < w//2 else "R"
+                        # Check answer against JSON (either string match or index match)
+                        ans = current_q["answer"]
+                        correct = False
+                        if current_q["type"] == "image_choice":
+                            correct = (side == "L" and ans == current_q["images"][0]) or (side == "R" and ans == current_q["images"][1])
+                        else:
+                            # Simple logic for True/False or MCQ
+                            if "options" in current_q:
+                                correct = (side == "L" and ans == current_q["options"][0]) or (side == "R" and ans == current_q["options"][1])
+                            else:
+                                correct = (side == "L" and "True" in ans) or (side == "R" and "False" in ans)
+                        
+                        timer_seconds += 120 if correct else -180
+                        in_question = False
+                        ball.reset()
+                    else:
+                        bullets.append(Bullet(tip[0], tip[1], (dx/dist)*BULLET_SPEED, (dy/dist)*BULLET_SPEED))
+                    
+                    last_shoot_time = time.time()
+
+        ball.draw(frame)
+        draw_ui(frame, timer_seconds)
+        
+        # Click to Quit
+        if mouse_click_pos:
+            mx, my = mouse_click_pos
+            if QUIT_BUTTON["tl"][0] < mx < QUIT_BUTTON["br"][0] and QUIT_BUTTON["tl"][1] < my < QUIT_BUTTON["br"][1]:
+                break
+            mouse_click_pos = None
+
+        cv2.imshow(WINDOW_NAME, frame)
+        if cv2.waitKey(1) & 0xFF == ord('q') or timer_seconds <= 0: break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
+
+
+
+phase 3(add more count down)
+import cv2
+import mediapipe as mp
+import random
+import time
+import json
+from typing import List
+
+# ---------------- USER SETTINGS ----------------
+CAMERA_INDEX = 0
+WINDOW_NAME = "MotionQuiz - Hand Game"
+START_TIMER_SECONDS = 10 * 60
+BALL_RADIUS = 30
+BALL_COLOR = (50, 150, 255)
+BALL_FALL_SPEED = 6
+BULLET_SPEED = 4000.0
+BULLET_THICKNESS = 4
+BULLET_COLOR = (0, 255, 255)
+BULLET_LIFETIME = 1.2
+QUESTION_TIMEOUT = 15.0
+SHOOT_COOLDOWN = 0.5
+HITBOX_RADIUS = 45
+COUNTDOWN_DURATION = 3  # Seconds to prepare
+
+# ---------------- Load Questions ----------------
+QUESTIONS_DATA = []
+try:
+    with open("questions.json", "r") as f:
+        data = json.load(f)
+        QUESTIONS_DATA = data["questions"]
+except Exception as e:
+    print(f"Error loading JSON: {e}")
+    QUESTIONS_DATA = [{"question": "JSON Error!", "answer": "True", "type": "true_false"}]
+
+# ---------------- MediaPipe Setup ----------------
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+
+QUIT_BUTTON = {"tl": (0, 0), "br": (0, 0)}
+mouse_click_pos = None
+
+def on_mouse(event, x, y, flags, param):
+    global mouse_click_pos
+    if event == cv2.EVENT_LBUTTONDOWN:
+        mouse_click_pos = (x, y)
+
+def is_pistol_gesture(hand_landmarks) -> bool:
+    try:
+        lm = hand_landmarks.landmark
+        def finger_up(tip, pip): return lm[tip].y < lm[pip].y
+        return finger_up(8, 6) and finger_up(12, 10) and not finger_up(16, 14) and not finger_up(20, 18)
+    except: return False
+
+def landmark_to_pixel(landmark, frame_w, frame_h):
+    return int(landmark.x * frame_w), int(landmark.y * frame_h)
+
+class FallingBall:
+    def __init__(self, w, h):
+        self.w, self.h = w, h
+        self.reset()
+    def reset(self):
+        self.x = random.randint(BALL_RADIUS + 10, self.w - BALL_RADIUS - 10)
+        self.y = -BALL_RADIUS
+        self.active = True
+    def update(self):
+        if self.active:
+            self.y += BALL_FALL_SPEED
+            if self.y > self.h: self.reset()
+    def draw(self, frame):
+        cv2.circle(frame, (int(self.x), int(self.y)), BALL_RADIUS, BALL_COLOR, -1)
+    def is_hit(self, px, py):
+        return ((px - self.x)**2 + (py - self.y)**2) <= (HITBOX_RADIUS**2)
+
+class Bullet:
+    def __init__(self, x, y, dx, dy):
+        self.x, self.y, self.dx, self.dy = x, y, dx, dy
+        self.spawn_time = time.time()
+    def update(self, dt):
+        self.x += self.dx * dt
+        self.y += self.dy * dt
+    def draw(self, frame):
+        cv2.line(frame, (int(self.x), int(self.y)), (int(self.x - self.dx*0.02), int(self.y - self.dy*0.02)), BULLET_COLOR, BULLET_THICKNESS)
+
+def main():
+    global mouse_click_pos
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(WINDOW_NAME, on_mouse)
+    
+    ok, frame = cap.read()
+    h, w = frame.shape[:2]
+    ball = FallingBall(w, h)
+    bullets = []
+    hands = mp_hands.Hands(min_detection_confidence=0.7)
+    
+    timer_seconds = START_TIMER_SECONDS
+    last_time = time.time()
+    
+    # Game States
+    in_question = False
+    in_countdown = False
+    
+    current_q = None
+    q_start_time = 0
+    countdown_start_time = 0
+    last_shoot_time = 0
+
+    while cap.isOpened():
+        ok, frame = cap.read()
+        if not ok: break
+        frame = cv2.flip(frame, 1)
+        now = time.time()
+        dt = now - last_time
+        last_time = now
+
+        if not in_question and not in_countdown:
+            timer_seconds -= dt
+            ball.update()
+        
+        results = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        
+        # Bullets & Collision
+        for b in bullets[:]:
+            b.update(dt)
+            b.draw(frame)
+            if time.time() - b.spawn_time > BULLET_LIFETIME: 
+                bullets.remove(b)
+            elif not in_question and not in_countdown and ball.is_hit(b.x, b.y):
+                # TRIGGER COUNTDOWN INSTEAD OF QUESTION
+                in_countdown = True
+                countdown_start_time = time.time()
+                bullets.remove(b)
+
+        # --- COUNTDOWN LOGIC ---
+        if in_countdown:
+            elapsed = time.time() - countdown_start_time
+            remaining = int(COUNTDOWN_DURATION - elapsed) + 1
+            
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (0, h//2-100), (w, h//2+100), (0, 0, 0), -1)
+            frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
+            
+            cv2.putText(frame, "GET READY!", (w//2-140, h//2-20), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 255), 4)
+            cv2.putText(frame, str(remaining), (w//2-20, h//2+60), cv2.FONT_HERSHEY_SIMPLEX, 3, (255, 255, 255), 6)
+            
+            if elapsed >= COUNTDOWN_DURATION:
+                in_countdown = False
+                in_question = True
+                current_q = random.choice(QUESTIONS_DATA)
+                q_start_time = time.time()
+
+        # --- QUESTION OVERLAY ---
+        if in_question:
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (50, 50), (w-50, h-50), (0, 0, 0), -1)
+            frame = cv2.addWeighted(overlay, 0.7, frame, 0.3, 0)
+            cv2.putText(frame, current_q["question"], (70, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            
+            if current_q.get("type") == "image_choice" and "images" in current_q:
+                for i, img_path in enumerate(current_q["images"][:2]):
+                    img = cv2.imread(img_path)
+                    if img is not None:
+                        img = cv2.resize(img, (200, 150))
+                        x_pos = 100 if i == 0 else w - 300
+                        frame[200:350, x_pos:x_pos+200] = img
+                        cv2.putText(frame, "LEFT" if i == 0 else "RIGHT", (x_pos, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+
+            if time.time() - q_start_time > QUESTION_TIMEOUT:
+                in_question = False
+                timer_seconds -= 60
+                ball.reset()
+
+        # --- SHOOTING ---
+        if results.multi_hand_landmarks:
+            for hl in results.multi_hand_landmarks:
+                mp_drawing.draw_landmarks(frame, hl, mp_hands.HAND_CONNECTIONS)
+                if is_pistol_gesture(hl) and (time.time() - last_shoot_time > SHOOT_COOLDOWN):
+                    tip = landmark_to_pixel(hl.landmark[8], w, h)
+                    knuckle = landmark_to_pixel(hl.landmark[5], w, h)
+                    dx, dy = tip[0] - knuckle[0], tip[1] - knuckle[1]
+                    dist = (dx**2 + dy**2)**0.5 or 1
+                    
+                    if in_question:
+                        side = "L" if tip[0] < w//2 else "R"
+                        ans = current_q["answer"]
+                        correct = False
+                        if current_q["type"] == "image_choice":
+                            correct = (side == "L" and ans == current_q["images"][0]) or (side == "R" and ans == current_q["images"][1])
+                        elif "options" in current_q:
+                            correct = (side == "L" and ans == current_q["options"][0]) or (side == "R" and ans == current_q["options"][1])
+                        else:
+                            correct = (side == "L" and "True" in ans) or (side == "R" and "False" in ans)
+                        
+                        timer_seconds += 120 if correct else -180
+                        in_question = False
+                        ball.reset()
+                    elif not in_countdown: # Don't shoot during countdown
+                        bullets.append(Bullet(tip[0], tip[1], (dx/dist)*BULLET_SPEED, (dy/dist)*BULLET_SPEED))
+                    
+                    last_shoot_time = time.time()
+
+        # UI
+        ball.draw(frame)
+        m, s = divmod(int(max(0, timer_seconds)), 60)
+        cv2.putText(frame, f"TIME: {m:02d}:{s:02d}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        
+        cv2.imshow(WINDOW_NAME, frame)
+        if cv2.waitKey(1) & 0xFF == ord('q') or timer_seconds <= 0: break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
+
+
+phase 4 (finish but add more need to add more improvement like gui and more feature)
+
+import cv2
+import mediapipe as mp
+import random
+import time
+import json
+import os
+
+# ---------------- CONFIGURATION ----------------
+CAMERA_INDEX = 0
+WINDOW_NAME = "⭐ MAGIC MOTION QUIZ ⭐"
+START_TIMER_SECONDS = 10 * 60
+BALL_RADIUS = 35
+BULLET_SPEED = 500.0
+BULLET_COLOR = (0, 255, 255) 
+SHOOT_COOLDOWN = 0.5
+COUNTDOWN_DURATION = 3
+
+# ---------------- Load Questions ----------------
+QUESTIONS_DATA = []
+try:
+    # Ensure your file is named exactly questions.json in the same folder
+    with open("questions.json", "r") as f:
+        data = json.load(f)
+        QUESTIONS_DATA = data["questions"]
+except Exception as e:
+    print(f"JSON Error: {e}")
+
+class Bullet:
+    def __init__(self, x, y, dx, dy):
+        self.x, self.y, self.dx, self.dy = float(x), float(y), float(dx), float(dy)
+        self.spawn_time = time.time()
+
+class FallingBall:
+    def __init__(self, w, h):
+        self.w, self.h = w, h
+        self.reset()
+    def reset(self):
+        self.x = random.randint(50, self.w - 50)
+        self.y = -50
+        self.active = True
+        self.color = (random.randint(100, 255), random.randint(100, 255), 0)
+    def update(self):
+        if self.active:
+            self.y += 7
+            if self.y > self.h: self.reset()
+    def draw(self, frame):
+        cv2.circle(frame, (int(self.x), int(self.y)), BALL_RADIUS, self.color, -1)
+        cv2.circle(frame, (int(self.x), int(self.y)), BALL_RADIUS, (255, 255, 255), 3)
+
+def draw_fancy_text(img, text, pos, size=1.0, color=(255, 255, 255), thickness=2):
+    x, y = pos
+    cv2.putText(img, str(text), (x+2, y+2), cv2.FONT_HERSHEY_DUPLEX, size, (0, 0, 0), thickness+2, cv2.LINE_AA)
+    cv2.putText(img, str(text), (x, y), cv2.FONT_HERSHEY_DUPLEX, size, color, thickness, cv2.LINE_AA)
+
+def is_pistol_gesture(hl):
+    lm = hl.landmark
+    # Index and Middle fingers up, others down
+    return lm[8].y < lm[6].y and lm[12].y < lm[10].y and lm[16].y > lm[14].y
+
+def main():
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    if not cap.isOpened(): return
+
+    cv2.namedWindow(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN)
+    cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
+    ok, frame = cap.read()
+    h, w = frame.shape[:2]
+    
+    mp_hands = mp.solutions.hands
+    mp_drawing = mp.solutions.drawing_utils
+    hands = mp_hands.Hands(min_detection_confidence=0.7, min_tracking_confidence=0.7)
+    
+    ball = FallingBall(w, h)
+    bullets, score = [], 0
+    timer_seconds = START_TIMER_SECONDS
+    last_time = time.time()
+    state = "PLAYING" # States: PLAYING, COUNTDOWN, QUESTION, FEEDBACK
+    
+    current_q, countdown_start = None, 0
+    feedback_msg, feedback_color, feedback_time = "", (0, 255, 0), 0
+    last_shoot_time = 0
+
+    while cap.isOpened():
+        ok, frame = cap.read()
+        if not ok: break
+        frame = cv2.flip(frame, 1)
+        dt = time.time() - last_time
+        last_time = time.time()
+
+        if state == "PLAYING":
+            timer_seconds -= dt
+            ball.update()
+
+        results = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        
+        # HUD Background
+        cv2.rectangle(frame, (0, 0), (w, 60), (40, 40, 40), -1)
+        draw_fancy_text(frame, f"SCORE: {score}", (20, 40), 1.0, (0, 255, 0))
+        m, s = divmod(int(max(0, timer_seconds)), 60)
+        draw_fancy_text(frame, f"TIME: {m:02d}:{s:02d}", (w-200, 40), 1.0, (0, 255, 255))
+
+        if state == "PLAYING":
+            ball.draw(frame)
+            for b in bullets[:]:
+                b.x += b.dx * dt; b.y += b.dy * dt
+                cv2.circle(frame, (int(b.x), int(b.y)), 10, BULLET_COLOR, -1)
+                # Check hit on ball
+                if ((b.x - ball.x)**2 + (b.y - ball.y)**2) < (BALL_RADIUS + 20)**2:
+                    if QUESTIONS_DATA:
+                        state = "COUNTDOWN"; countdown_start = time.time()
+                    bullets.remove(b)
+                elif time.time() - b.spawn_time > 1.2: 
+                    bullets.remove(b)
+
+        elif state == "COUNTDOWN":
+            elapsed = time.time() - countdown_start
+            num = int(COUNTDOWN_DURATION - elapsed) + 1
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 0), -1)
+            frame = cv2.addWeighted(overlay, 0.5, frame, 0.5, 0)
+            draw_fancy_text(frame, "GET READY!", (w//2-140, h//2-50), 2.0, (0, 255, 255), 4)
+            draw_fancy_text(frame, str(num), (w//2-30, h//2+80), 4.0, (255, 255, 255), 6)
+            if elapsed >= COUNTDOWN_DURATION:
+                state = "QUESTION"
+                current_q = random.choice(QUESTIONS_DATA)
+
+        elif state == "QUESTION":
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (40, 70), (w-40, h-40), (60, 30, 30), -1)
+            frame = cv2.addWeighted(overlay, 0.8, frame, 0.2, 0)
+            draw_fancy_text(frame, current_q["question"], (60, 120), 0.7, (255, 255, 255))
+            
+            # Display answers based on type
+            if current_q["type"] == "true_false":
+                # Position True (Left) and False (Right) clearly
+                draw_fancy_text(frame, "TRUE", (w//4 - 50, 350), 2.0, (0, 255, 0), 4)
+                draw_fancy_text(frame, "FALSE", (3*w//4 - 50, 350), 2.0, (0, 0, 255), 4)
+            else:
+                # Use "images" if available, else fallback to "options"
+                items = current_q.get("images", current_q.get("options", []))
+                for i in range(min(len(items), 2)):
+                    img_name = items[i]
+                    # Attempt to find file (handles hidden extensions)
+                    path = img_name if os.path.exists(img_name) else img_name + ".jpg"
+                    if os.path.exists(path):
+                        raw_img = cv2.imread(path)
+                        if raw_img is not None:
+                            img_disp = cv2.resize(raw_img, (250, 180))
+                            x_pos = 80 if i == 0 else w - 330
+                            frame[250:430, x_pos:x_pos+250] = img_disp
+                            cv2.rectangle(frame, (x_pos, 250), (x_pos+250, 430), (255, 255, 255), 3)
+                    else:
+                        # If no image found, show text labels
+                        x_label = 100 if i == 0 else w - 400
+                        draw_fancy_text(frame, str(img_name).upper(), (x_label, 350), 1.2, (255, 255, 255), 3)
+
+        elif state == "FEEDBACK":
+            draw_fancy_text(frame, feedback_msg, (w//2-150, h//2), 2.0, feedback_color, 4)
+            if time.time() - feedback_time > 1.5:
+                state = "PLAYING"; ball.reset()
+
+        # Hand Tracking & Interaction
+        if results.multi_hand_landmarks:
+            for hl in results.multi_hand_landmarks:
+                mp_drawing.draw_landmarks(frame, hl, mp_hands.HAND_CONNECTIONS)
+                
+                if is_pistol_gesture(hl) and (time.time() - last_shoot_time > SHOOT_COOLDOWN):
+                    tx, ty = int(hl.landmark[8].x * w), int(hl.landmark[8].y * h)
+                    
+                    if state == "QUESTION":
+                        is_left = tx < w//2
+                        ans = str(current_q.get("answer", ""))
+                        correct = False
+                        
+                        if current_q["type"] == "true_false":
+                            correct = (ans == "True" and is_left) or (ans == "False" and not is_left)
+                        else:
+                            items = current_q.get("images", current_q.get("options", []))
+                            if is_left and ans == items[0]: correct = True
+                            elif not is_left and len(items) > 1 and ans == items[1]: correct = True
+                        
+                        if correct:
+                            score += 10; feedback_msg = "CORRECT! +10"; feedback_color = (0, 255, 0)
+                        else:
+                            score -= 5; feedback_msg = "WRONG! -5"; feedback_color = (0, 0, 255)
+                        state = "FEEDBACK"; feedback_time = time.time()
+                        
+                    elif state == "PLAYING":
+                        # Shoot bullet
+                        kx, ky = int(hl.landmark[5].x * w), int(hl.landmark[5].y * h)
+                        dx, dy = tx - kx, ty - ky
+                        mag = (dx**2 + dy**2)**0.5 or 1
+                        bullets.append(Bullet(tx, ty, (dx/mag)*BULLET_SPEED, (dy/mag)*BULLET_SPEED))
+                        
+                    last_shoot_time = time.time()
+
+        cv2.imshow(WINDOW_NAME, frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'): break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()

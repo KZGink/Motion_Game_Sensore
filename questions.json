@@ -1,0 +1,142 @@
+{
+  "questions": [
+    {
+      "id": 1,
+      "type": "mcq",
+      "question": "What part of the computer shows the picture?",
+      "options": ["keyboard.jpg", "mouse.jpg", "monitor.jpg"],
+      "answer": "monitor.jpg"
+    },
+    {
+      "id": 2,
+      "type": "mcq",
+      "question": "Which part lets you type letters and numbers?",
+      "options": ["keyboard.jpg", "speaker.jpg", "webcam.jpg"],
+      "answer": "keyboard.jpg"
+    },
+    {
+      "id": 3,
+      "type": "mcq",
+      "question": "What device do you use to move the cursor on the screen?",
+      "options": ["usb.jpg", "mouse.jpg", "headphones.jpg"],
+      "answer": "mouse.jpg"
+    },
+    {
+      "id": 4,
+      "type": "mcq",
+      "question": "What part of the computer stores all the files?",
+      "options": ["harddrive.jpg", "monitor.jpg", "keyboard.jpg"],
+      "answer": "harddrive.jpg"
+    },
+    {
+      "id": 5,
+      "type": "mcq",
+      "question": "Which part lets the computer connect to the internet?",
+      "options": ["router.jpg", "mouse.jpg", "speaker.jpg"],
+      "answer": "router.jpg"
+    },
+    {
+      "id": 6,
+      "type": "mcq",
+      "question": "Which device helps you hear sound?",
+      "options": ["Speakers.jpg", "keyboard.jpg", "monitor.jpg"],
+      "answer": "speaker.jpg"
+    },
+    {
+      "id": 7,
+      "type": "mcq",
+      "question": "What part of the computer processes and controls everything?",
+      "options": ["CPU", "mouse.jpg", "printer.jpg"],
+      "answer": "CPU"
+    },
+    {
+      "id": 8,
+      "type": "mcq",
+      "question": "Which device can print documents and photos?",
+      "options": ["printer.jpg", "speaker.jpg", "usb.jpg"],
+      "answer": "printer.jpg"
+    },
+    {
+      "id": 9,
+  "type": "mcq",
+  "question": "What input device lets you speak to the computer?",
+  "images": ["microphone.jpg", "mouse.jpg"],
+  "answer": "microphone.jpg"
+    },
+    {
+      "id": 10,
+      "type": "mcq",
+      "question": "What device is used to save files and carry them anywhere?",
+      "options": ["usb.jpg", "monitor.jpg", "speaker.jpg"],
+      "answer": "usb.jpg"
+    },
+  {
+      "id": 11,
+      "type": "true_false",
+      "question": "True or False: The monitor is an input device.",
+      "answer": "False"
+    },
+    {
+      "id": 12,
+      "type": "true_false",
+      "question": "True or False: The CPU is known as the brain of the computer.",
+      "answer": "True"
+    },
+    {
+      "id": 13,
+      "type": "image_choice",
+      "question": "Which one is the monitor?",
+      "images": ["monitor.jpg", "mouse.jpg", "keyboard.jpg"],
+      "answer": "monitor.jpg"
+    },
+    {
+      "id": 14,
+      "type": "image_choice",
+      "question": "Tap the picture of the keyboard.",
+      "images": ["keyboard.jpg", "printer.jpg", "speaker.jpg"],
+      "answer": "keyboard.jpg"
+    },
+    {
+      "id": 15,
+      "type": "image_choice",
+      "question": "Which picture shows a CPU?",
+      "images": ["cpu.jpg", "monitor.jpg", "headphones.jpg"],
+      "answer": "cpu.jpg"
+    },
+    {
+      "id": 16,
+      "type": "image_choice",
+      "question": "Select the mouse.",
+      "images": ["mouse.jpg", "webcam.jpg", "usb.jpg"],
+      "answer": "mouse.jpg"
+    },
+    {
+      "id": 17,
+      "type": "image_choice",
+      "question": "Which one is a printer?",
+      "images": ["printer.jpg", "harddrive.jpg", "speaker.jpg"],
+      "answer": "printer.jpg"
+    },
+    {
+      "id": 18,
+      "type": "image_choice",
+      "question": "Choose the photo of a USB flash drive.",
+      "images": ["usb.jpg", "router.jpg", "keyboard.jpg"],
+      "answer": "usb.jpg"
+    },
+    {
+      "id": 19,
+      "type": "image_choice",
+      "question": "Which picture shows a microphone?",
+      "images": ["microphone.jpg", "mouse.jpg", "monitor.jpg"],
+      "answer": "microphone.jpg"
+    },
+    {
+      "id": 20,
+      "type": "image_choice",
+      "question": "Tap the image of the speakers.",
+      "images": ["speakers.jpg", "webcam.jpg", "monitor.jpg"],
+      "answer": "speakers.jpg"
+    }
+  ]
+}
